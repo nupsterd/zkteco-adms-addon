@@ -25,4 +25,3 @@ environment:
   HA_URL: "http://homeassistant:8123"
   HA_TOKEN: "{{ha_token}}"
   ADMS_PORT: "{{adms_port}}"
-image: "ghcr.io/nupsterd/zkteco-adms-addon/{arch}"
