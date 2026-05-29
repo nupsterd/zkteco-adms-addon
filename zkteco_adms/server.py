@@ -181,6 +181,10 @@ async def handle_status(request: web.Request) -> web.Response:
         "timestamp": datetime.now().isoformat(),
     })
 
+async def handle_catch_all(request: web.Request) -> web.Response:
+    body = await request.text()
+    logger.info(f"CATCH ALL: method={request.method} path={request.path} query={request.query_string} body={body[:200]}")
+    return web.Response(text="OK")
 
 def create_app() -> web.Application:
     app = web.Application()
@@ -189,6 +193,7 @@ def create_app() -> web.Application:
     app.router.add_route("GET", "/iclock/getrequest", handle_getrequest)
     app.router.add_route("POST", "/iclock/devicecmd", handle_devicecmd)
     app.router.add_route("GET", "/status", handle_status)
+    app.router.add_route("*", "/{path_info:.*}", handle_catch_all)
     return app
 
 
