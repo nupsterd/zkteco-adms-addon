@@ -15,9 +15,19 @@ from urllib.parse import parse_qs
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
 
-HA_URL = os.environ.get("HA_URL", "http://homeassistant.local:8123")
-HA_TOKEN = os.environ.get("HA_TOKEN", "")
-ADMS_PORT = int(os.environ.get("ADMS_PORT", "8083"))
+# Read config from HA add-on options
+def load_options():
+    options_file = "/data/options.json"
+    if os.path.exists(options_file):
+        with open(options_file) as f:
+            return json.load(f)
+    return {}
+
+_options = load_options()
+HA_URL = "http://supervisor/core"
+HA_TOKEN = _options.get("ha_token", os.environ.get("HA_TOKEN", ""))
+ADMS_PORT = int(_options.get("adms_port", os.environ.get("ADMS_PORT", "8083")))
+SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
 
 VERIFY_METHODS = {
     "0": "fingerprint",
@@ -52,7 +62,9 @@ def generate_self_signed_cert():
 
 async def fire_ha_event(event_type: str, event_data: dict):
     """Fire an event in Home Assistant."""
-    if not HA_TOKEN:
+    # Use SUPERVISOR_TOKEN (auto-provided) or user token
+    token = SUPERVISOR_TOKEN or HA_TOKEN
+    if not token:
         logger.warning("No HA_TOKEN configured, skipping event")
         return
 
@@ -60,7 +72,7 @@ async def fire_ha_event(event_type: str, event_data: dict):
         import aiohttp
         url = f"{HA_URL}/api/events/{event_type}"
         headers = {
-            "Authorization": f"Bearer {HA_TOKEN}",
+            "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         }
         async with aiohttp.ClientSession() as session:
@@ -68,28 +80,31 @@ async def fire_ha_event(event_type: str, event_data: dict):
                 if resp.status == 200:
                     logger.info(f"HA event fired: {event_type} -> {event_data}")
                 else:
-                    logger.error(f"Failed to fire event: {resp.status}")
+                    text = await resp.text()
+                    logger.error(f"Failed to fire event: {resp.status} {text}")
     except Exception as e:
         logger.error(f"Error firing HA event: {e}")
 
 
 async def update_ha_sensor(entity_id: str, state: str, attributes: dict = None):
     """Update a sensor state in Home Assistant."""
-    if not HA_TOKEN:
+    token = SUPERVISOR_TOKEN or HA_TOKEN
+    if not token:
         return
 
     try:
         import aiohttp
         url = f"{HA_URL}/api/states/{entity_id}"
         headers = {
-            "Authorization": f"Bearer {HA_TOKEN}",
+            "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         }
         payload = {"state": state, "attributes": attributes or {}}
         async with aiohttp.ClientSession() as session:
             async with session.post(url, json=payload, headers=headers, ssl=False) as resp:
                 if resp.status not in (200, 201):
-                    logger.error(f"Failed to update sensor {entity_id}: {resp.status}")
+                    text = await resp.text()
+                    logger.error(f"Failed to update sensor {entity_id}: {resp.status} {text}")
     except Exception as e:
         logger.error(f"Error updating HA sensor: {e}")
 
@@ -277,6 +292,8 @@ async def main():
     server = await asyncio.start_server(handle_client, '0.0.0.0', ADMS_PORT, ssl=ssl_ctx)
     logger.info(f"ZKTeco ADMS Server (TLS) running on port {ADMS_PORT}")
     logger.info(f"Home Assistant URL: {HA_URL}")
+    logger.info(f"SUPERVISOR_TOKEN: {'configured' if SUPERVISOR_TOKEN else 'not found'}")
+    logger.info(f"HA_TOKEN: {'configured' if HA_TOKEN else 'not found'}")
     
     async with server:
         await server.serve_forever()

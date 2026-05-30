@@ -1,8 +1,10 @@
 name: "ZKTeco ADMS Server"
 description: "Servidor ADMS para dispositivos ZKTeco. Recibe eventos de asistencia y acceso y los publica en Home Assistant."
-version: "1.2.0"
+version: "1.3.0"
 slug: "zkteco_adms"
 init: false
+hassio_api: true
+homeassistant_api: true
 arch:
   - aarch64
   - armhf
@@ -19,9 +21,5 @@ options:
   ha_token: ""
   adms_port: 8083
 schema:
-  ha_token: str
+  ha_token: str?
   adms_port: int
-environment:
-  HA_URL: "http://homeassistant:8123"
-  HA_TOKEN: "{{ha_token}}"
-  ADMS_PORT: "{{adms_port}}"
