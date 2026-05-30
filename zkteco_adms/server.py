@@ -24,10 +24,15 @@ def load_options():
     return {}
 
 _options = load_options()
-HA_URL = "http://supervisor/core"
 HA_TOKEN = _options.get("ha_token", os.environ.get("HA_TOKEN", ""))
 ADMS_PORT = int(_options.get("adms_port", os.environ.get("ADMS_PORT", "8083")))
 SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
+
+# Use Supervisor API if token available, otherwise direct HA connection
+if SUPERVISOR_TOKEN:
+    HA_URL = "http://supervisor/core"
+else:
+    HA_URL = "http://homeassistant:8123"
 
 VERIFY_METHODS = {
     "0": "fingerprint",
