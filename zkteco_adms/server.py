@@ -32,7 +32,7 @@ SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
 if SUPERVISOR_TOKEN:
     HA_URL = "http://supervisor/core"
 else:
-    HA_URL = "http://homeassistant:8123"
+    HA_URL = "https://homeassistant:8123"
 
 VERIFY_METHODS = {
     "0": "fingerprint",

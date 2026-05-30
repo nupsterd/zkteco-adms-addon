@@ -1,6 +1,6 @@
 name: "ZKTeco ADMS Server"
 description: "Servidor ADMS para dispositivos ZKTeco. Recibe eventos de asistencia y acceso y los publica en Home Assistant."
-version: "1.4.0"
+version: "1.5.0"
 slug: "zkteco_adms"
 init: false
 hassio_api: true
