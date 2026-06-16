@@ -37,11 +37,16 @@ PV_BACKEND_URL = _options.get("pv_backend_url", "")
 PV_BACKEND_TOKEN = _options.get("pv_backend_verify_token", "")
 PV_BACKEND_QUEUE_MAXSIZE = int(_options.get("pv_backend_queue_maxsize", 1000))
 PV_BACKEND_TIMEOUT = float(_options.get("pv_backend_timeout_seconds", 3))
-AUDIT_LOG_PATH = _options.get("audit_log_path", "/config/audit.log")
+# `or` (no solo el default de .get): el campo es opcional (str?), asi que puede
+# venir ausente, null o "" desde la UI -> caemos siempre al default (§5.9.36).
+AUDIT_LOG_PATH = _options.get("audit_log_path") or "/config/audit.log"
 
 # Inicializados en main() antes de servir.
 _audit = None
 _forwarder = None
+
+# Contador in-memory de lineas no-ATTLOG filtradas (§5.9.40). Solo observabilidad.
+_skipped_attlog_count = 0
 
 # Use Supervisor API if token available, otherwise direct HA connection
 if SUPERVISOR_TOKEN:
@@ -198,8 +203,36 @@ def build_cdata_response(sn: str) -> str:
     return build_response("200 OK", body)
 
 
+def _is_valid_attlog_line(line: str) -> bool:
+    """True si la linea es un ATTLOG real (evento de verificacion). Pura, sin side effects.
+
+    El ADMS manda por /iclock/cdata con body cosas que NO son ATTLOG (OPLOG,
+    dumps de la tabla USER, etc). Sin este filtro entran al audit/fan-out como
+    basura (§5.9.40). Criterios (evidencia E2E v1.7.0):
+
+    1. >= 4 campos tab-separated.
+    2. parts[0] numerico (user_id).
+    3. parts[1] datetime 'YYYY-MM-DD HH:MM:SS'.
+    4. parts[2] numerico (status).
+    5. parts[3] numerico (verify_method code).
+    """
+    parts = line.strip().split("\t")
+    if len(parts) < 4:
+        return False
+    if not parts[0].isdigit():
+        return False
+    try:
+        datetime.strptime(parts[1], "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return False
+    if not parts[2].isdigit():
+        return False
+    return parts[3].isdigit()
+
+
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     """Handle each incoming TCP/TLS connection."""
+    global _skipped_attlog_count
     addr = writer.get_extra_info('peername')
     
     try:
@@ -229,6 +262,17 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 logger.info(f"ATTENDANCE DATA from {sn}: {body[:500]}")
                 lines = body.split("\n")
                 for line in lines:
+                    # §5.9.40: solo ATTLOG reales pasan. OPLOG, dumps de USER, etc
+                    # se saltean (no HA, no audit, no fan-out). Fail-silent.
+                    if not _is_valid_attlog_line(line):
+                        if line.strip():
+                            _skipped_attlog_count += 1
+                            logger.debug(f"SKIPPED non-ATTLOG line: {line.strip()[:120]}")
+                            if _skipped_attlog_count % 50 == 1:
+                                logger.warning(
+                                    f"Filtered {_skipped_attlog_count} non-ATTLOG lines (cumulative)"
+                                )
+                        continue
                     parts = line.strip().split("\t")
                     if len(parts) >= 4:
                         event_data = {

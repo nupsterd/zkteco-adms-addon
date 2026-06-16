@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.7.1
+
+**Patch: bugfixes detectados en la validación E2E de v1.7.0 (sin nuevas features).**
+
+- **§5.9.36 — `audit_log_path` opcional.** En v1.7.0 el campo estaba declarado
+  `audit_log_path: str` (requerido) en el schema, así que guardar configuración
+  en la UI sin ese campo fallaba con "Missing option 'audit_log_path' in root".
+  Ahora es `str?` (opcional) y `server.py` cae al default `/config/audit.log`
+  ante ausente / null / "".
+- **§5.9.40 — Filtro estricto de ATTLOG.** La rama `/iclock/cdata` con body
+  procesaba CUALQUIER línea con 4+ campos tab-separated como evento de acceso,
+  dejando entrar al audit y al fan-out líneas que NO son ATTLOG (OPLOG, dumps de
+  la tabla USER, etc.). Nuevo helper puro `_is_valid_attlog_line()` valida 5
+  criterios (user_id numérico, timestamp `YYYY-MM-DD HH:MM:SS`, status y
+  verify_method numéricos); las líneas inválidas se saltean a nivel `debug` (con
+  contador acumulado a `warning` cada 50). La rama "sin body" (DEVICE REGISTERED
+  → `device_state`) NO cambia. Bug heredado de v1.6.0.
+
 ## 1.7.0
 
 **AuditLogger + BackendForwarder asyncio (paridad con Hikvision ISAPI Listener v1.2.0).**
