@@ -12,6 +12,10 @@ import subprocess
 from datetime import datetime
 from urllib.parse import parse_qs
 
+from audit import AuditLogger
+from audit_schema import build_access_record, build_device_state_record
+from forwarder import BackendForwarder
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -27,6 +31,17 @@ _options = load_options()
 HA_TOKEN = _options.get("ha_token", os.environ.get("HA_TOKEN", ""))
 ADMS_PORT = int(_options.get("adms_port", os.environ.get("ADMS_PORT", "8083")))
 SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
+
+# Fan-out OPT-IN al backend pv-backend (v1.7.0). Vacio = desactivado.
+PV_BACKEND_URL = _options.get("pv_backend_url", "")
+PV_BACKEND_TOKEN = _options.get("pv_backend_verify_token", "")
+PV_BACKEND_QUEUE_MAXSIZE = int(_options.get("pv_backend_queue_maxsize", 1000))
+PV_BACKEND_TIMEOUT = float(_options.get("pv_backend_timeout_seconds", 3))
+AUDIT_LOG_PATH = _options.get("audit_log_path", "/config/audit.log")
+
+# Inicializados en main() antes de servir.
+_audit = None
+_forwarder = None
 
 # Use Supervisor API if token available, otherwise direct HA connection
 if SUPERVISOR_TOKEN:
@@ -235,6 +250,26 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                                 "status": parts[2],
                             }
                         )
+                        # Audit local + fan-out al backend (v1.7.0). Fail-silent
+                        # total: nunca rompe el reenvio a HA ni la respuesta ADMS.
+                        record = build_access_record(
+                            sn=sn,
+                            user_id=parts[0],
+                            device_ts=parts[1],
+                            status=parts[2],
+                            verify_method=VERIFY_METHODS.get(parts[3], "unknown"),
+                            raw_line=line.strip(),
+                        )
+                        if _audit is not None:
+                            try:
+                                await _audit.write(record)
+                            except Exception:
+                                logger.exception("audit.write failed (continuing)")
+                        if _forwarder is not None:
+                            try:
+                                await _forwarder.enqueue(record)
+                            except Exception:
+                                logger.exception("forwarder.enqueue failed (continuing)")
                 response = build_response("200 OK", "OK")
             else:
                 logger.info(f"DEVICE REGISTERED: SN={sn}")
@@ -252,6 +287,18 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     "serial_number": sn,
                     "timestamp": connected_devices[sn],
                 })
+                # Audit local + fan-out al backend (v1.7.0). Fail-silent total.
+                record = build_device_state_record(sn=sn, state="online")
+                if _audit is not None:
+                    try:
+                        await _audit.write(record)
+                    except Exception:
+                        logger.exception("audit.write failed (continuing)")
+                if _forwarder is not None:
+                    try:
+                        await _forwarder.enqueue(record)
+                    except Exception:
+                        logger.exception("forwarder.enqueue failed (continuing)")
                 response = build_cdata_response(sn)
         
         elif "/iclock/getrequest" in (path or ""):
@@ -284,9 +331,23 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
 
 async def main():
+    global _audit, _forwarder
+
     # Generate self-signed cert for TLS
     generate_self_signed_cert()
-    
+
+    # Audit local + fan-out OPT-IN al backend (v1.7.0). El audit se escribe
+    # SIEMPRE (paridad Hikvision, ADR-004 Opcion C); el forwarder solo si hay
+    # url + token configurados.
+    _audit = AuditLogger(AUDIT_LOG_PATH)
+    _forwarder = BackendForwarder(
+        url=PV_BACKEND_URL,
+        token=PV_BACKEND_TOKEN,
+        queue_maxsize=PV_BACKEND_QUEUE_MAXSIZE,
+        timeout_seconds=PV_BACKEND_TIMEOUT,
+    )
+    await _forwarder.start()
+
     # Create SSL context
     ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ssl_ctx.load_cert_chain(CERT_FILE, KEY_FILE)

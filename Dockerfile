@@ -6,7 +6,7 @@ ENV TZ=America/Bogota
 RUN apk add --no-cache openssl tzdata && \
     cp /usr/share/zoneinfo/$TZ /etc/localtime && \
     echo $TZ > /etc/timezone && \
-    pip3 install aiohttp
+    pip3 install aiohttp aiofiles
 
 WORKDIR /app
 COPY zkteco_adms/ /app/
