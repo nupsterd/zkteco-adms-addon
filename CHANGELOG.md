@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.7.2 (2026-06-16)
+
+Fix swap "3" ↔ "4" en VERIFY_METHODS (§5.9.41). Validado empíricamente con tráfico real del MB10-VL del piloto (UDP3260500207): la tarjeta RFID emite parts[3]="4" y el password tecleado emite parts[3]="3", inverso al mapping heredado. Sin cambios funcionales adicionales.
+
 ## 1.7.1
 
 **Patch: bugfixes detectados en la validación E2E de v1.7.0 (sin nuevas features).**

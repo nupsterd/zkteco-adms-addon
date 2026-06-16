@@ -58,8 +58,8 @@ VERIFY_METHODS = {
     "0": "fingerprint",
     "1": "fingerprint",
     "2": "face",
-    "3": "card",
-    "4": "password",
+    "3": "password",  # §5.9.41: el MB10-VL emite "3" al teclear password (no card)
+    "4": "card",      # §5.9.41: el MB10-VL emite "4" al pasar tarjeta RFID (no password)
     "15": "face",
 }
 
