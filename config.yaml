@@ -1,6 +1,6 @@
 name: "ZKTeco ADMS Server"
 description: "Servidor ADMS para dispositivos ZKTeco. Recibe eventos de asistencia y acceso y los publica en Home Assistant."
-version: "1.7.2"
+version: "1.8.0"
 slug: "zkteco_adms"
 init: false
 hassio_api: true
@@ -25,6 +25,8 @@ options:
   pv_backend_verify_token: ""
   pv_backend_queue_maxsize: 1000
   pv_backend_timeout_seconds: 3
+  control_endpoint_enabled: false
+  control_endpoint_token: ""
 schema:
   ha_token: str?
   adms_port: int
@@ -33,5 +35,7 @@ schema:
   pv_backend_verify_token: "password?"
   pv_backend_queue_maxsize: "int(10,100000)"
   pv_backend_timeout_seconds: "int(1,30)"
+  control_endpoint_enabled: bool
+  control_endpoint_token: "password?"
 map:
   - addon_config:rw    # monta /config -> /addon_configs/<slug>/ (audit visible desde core-ssh)

@@ -1,5 +1,25 @@
 # Changelog
 
+## [1.8.0] - 2026-06-24
+
+### Added
+- Endpoint local `POST /control/enqueue` para encolar comandos ADMS al device.
+  Auth via header `X-Control-Token` con secreto compartido.
+  Deshabilitado por defecto (`control_endpoint_enabled: false`).
+- Módulo `command_queue.py` con CommandQueue in-memory keyed por SN.
+- Tests unit + integration del nuevo endpoint.
+
+### Security
+- Redacción del campo `Passwd=` en logs forwardeados del packet USER.
+  Previene leak accidental de passwords asignados localmente en el menú del MB10-VL.
+  Ver §5.9.260 del PROJECT_HANDOFF.
+
+### Changed
+- Bump version a 1.8.0 (semver minor).
+
+> Nota PR A.1: el endpoint SOLO encola; el drain del comando en `getrequest`
+> llega en PR A.2 y el parseo del ACK en `devicecmd` en PR A.3.
+
 ## v1.7.2 (2026-06-16)
 
 Fix swap "3" ↔ "4" en VERIFY_METHODS (§5.9.41). Validado empíricamente con tráfico real del MB10-VL del piloto (UDP3260500207): la tarjeta RFID emite parts[3]="4" y el password tecleado emite parts[3]="3", inverso al mapping heredado. Sin cambios funcionales adicionales.

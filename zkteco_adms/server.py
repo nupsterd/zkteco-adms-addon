@@ -7,6 +7,8 @@ import asyncio
 import logging
 import json
 import os
+import re
+import secrets
 import ssl
 import subprocess
 from datetime import datetime
@@ -14,6 +16,7 @@ from urllib.parse import parse_qs
 
 from audit import AuditLogger
 from audit_schema import build_access_record, build_device_state_record
+from command_queue import CommandQueue
 from forwarder import BackendForwarder
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -41,9 +44,114 @@ PV_BACKEND_TIMEOUT = float(_options.get("pv_backend_timeout_seconds", 3))
 # venir ausente, null o "" desde la UI -> caemos siempre al default (§5.9.36).
 AUDIT_LOG_PATH = _options.get("audit_log_path") or "/config/audit.log"
 
+# Endpoint local de control (PR A.1, ADR-076). Deshabilitado por defecto: el
+# endpoint solo encola comandos ADMS hacia el device (drain en PR A.2). Sin
+# token configurado + habilitado => el endpoint responde 503 (config insegura)
+# pero el resto del flow ADMS sigue funcionando (no crashea el add-on).
+CONTROL_ENDPOINT_ENABLED = bool(_options.get("control_endpoint_enabled", False))
+CONTROL_ENDPOINT_TOKEN = _options.get("control_endpoint_token") or ""
+
+# Regex de validacion del payload del comando ZK: alfanumerico + separadores
+# comunes (`= , _ - : .` y espacio). Sin newlines ni caracteres de control para
+# que el payload no rompa la respuesta HTTP cruda ni el protocolo ADMS.
+_CONTROL_PAYLOAD_RE = re.compile(r"^[A-Za-z0-9 =,_\-:.]+$")
+
+# Redaccion del campo Passwd= en texto logueado (§5.9.260). `+` (no `*`): un
+# Passwd vacio (`Passwd=` seguido de tab) NO se toca porque no hay secreto que
+# filtrar (decision de diseno del prompt PR A.1).
+_PASSWD_RE = re.compile(r"Passwd=[^\t\s]+")
+
 # Inicializados en main() antes de servir.
 _audit = None
 _forwarder = None
+_command_queue = None
+
+
+def redact_passwd(text: str) -> str:
+    """Reemplaza el valor del campo `Passwd=<valor>` por `Passwd=<REDACTED>`.
+
+    El MB10-VL pushea un snapshot `USER PIN=... Passwd=<plain> ...` antes del
+    OPLOG de USER ADD/MODIFY (§5.9.260). El flow ADR-068 v2 NO usa passwords,
+    pero si el operador asigna uno localmente en el menu del device, queda en
+    texto plano en los logs del add-on. Esta funcion lo redacta ANTES de loguear.
+
+    Pura y fail-safe: un Passwd vacio se deja igual; texto sin Passwd no cambia.
+    """
+    if not text:
+        return text
+    return _PASSWD_RE.sub("Passwd=<REDACTED>", text)
+
+
+def _header_get(headers: dict, name: str) -> str:
+    """Lookup case-insensitive de un header (los HTTP headers no son case-sensitive)."""
+    if not headers:
+        return ""
+    target = name.lower()
+    for key, value in headers.items():
+        if key.lower() == target:
+            return value
+    return ""
+
+
+async def _handle_control_enqueue(method: str, headers: dict, body: str) -> str:
+    """Maneja `POST /control/enqueue`: encola un comando ADMS para un device.
+
+    Retorna la respuesta HTTP cruda ya construida (mismo patron raw-TCP que el
+    resto de `handle_client`). PR A.1 SOLO encola; el drain en `getrequest` es
+    PR A.2.
+    """
+    def _json(status: str, payload: dict) -> str:
+        return build_response(status, json.dumps(payload), "application/json")
+
+    # 1. Solo POST.
+    if method != "POST":
+        return _json("405 Method Not Allowed", {"error": "method_not_allowed"})
+
+    # 2. Endpoint deshabilitado => 404 (no revela que existe).
+    if not CONTROL_ENDPOINT_ENABLED:
+        return _json("404 Not Found", {"error": "not_found"})
+
+    # 3. Habilitado pero sin token configurado => config insegura => 503.
+    if not CONTROL_ENDPOINT_TOKEN:
+        logger.error(
+            "control_endpoint_enabled=true pero control_endpoint_token vacio: "
+            "endpoint /control/enqueue inseguro, respondiendo 503"
+        )
+        return _json("503 Service Unavailable", {"error": "endpoint_misconfigured"})
+
+    # 4. Auth: token compartido en header X-Control-Token (comparacion constante).
+    provided = _header_get(headers, "X-Control-Token")
+    if not provided or not secrets.compare_digest(provided, CONTROL_ENDPOINT_TOKEN):
+        return _json("401 Unauthorized", {"error": "unauthorized"})
+
+    # 5. Body JSON valido.
+    try:
+        data = json.loads(body) if body else None
+    except (ValueError, TypeError):
+        return _json("400 Bad Request", {"error": "invalid_json"})
+    if not isinstance(data, dict):
+        return _json("400 Bad Request", {"error": "invalid_json"})
+
+    # 6. Validacion de sn + payload.
+    sn = data.get("sn")
+    payload = data.get("payload")
+    if not isinstance(sn, str) or not sn.strip():
+        return _json("400 Bad Request", {"error": "invalid_sn"})
+    if not isinstance(payload, str) or not payload.strip():
+        return _json("400 Bad Request", {"error": "invalid_payload"})
+    if not _CONTROL_PAYLOAD_RE.match(payload):
+        return _json("400 Bad Request", {"error": "payload_has_forbidden_chars"})
+
+    if _command_queue is None:
+        logger.error("CommandQueue no inicializado, respondiendo 503")
+        return _json("503 Service Unavailable", {"error": "queue_unavailable"})
+
+    cmd = await _command_queue.enqueue(sn, payload)
+    logger.info(f"Command enqueued cmd_id={cmd.cmd_id} for sn={sn} payload={payload}")
+    return _json(
+        "201 Created",
+        {"cmd_id": cmd.cmd_id, "sn": cmd.sn, "enqueued_at": cmd.enqueued_at.isoformat()},
+    )
 
 # Contador in-memory de lineas no-ATTLOG filtradas (§5.9.40). Solo observabilidad.
 _skipped_attlog_count = 0
@@ -254,12 +362,18 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 "timestamp": datetime.now().isoformat(),
             })
             response = build_response("200 OK", status_data, "application/json")
-        
+
+        elif path == "/control/enqueue":
+            response = await _handle_control_enqueue(method, headers, body)
+
         elif "/iclock/cdata" in (path or ""):
             sn = query.get("SN", "unknown")
             
             if body and len(body) > 0:
-                logger.info(f"ATTENDANCE DATA from {sn}: {body[:500]}")
+                # §5.9.260: redactar Passwd= ANTES de loguear (anti-leak). El body
+                # original NO se altera: el ATTLOG nunca contiene Passwd, asi que el
+                # parsing aguas abajo sigue intacto (solo se redacta lo que se loguea).
+                logger.info(f"ATTENDANCE DATA from {sn}: {redact_passwd(body)[:500]}")
                 lines = body.split("\n")
                 for line in lines:
                     # §5.9.40: solo ATTLOG reales pasan. OPLOG, dumps de USER, etc
@@ -267,7 +381,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     if not _is_valid_attlog_line(line):
                         if line.strip():
                             _skipped_attlog_count += 1
-                            logger.debug(f"SKIPPED non-ATTLOG line: {line.strip()[:120]}")
+                            logger.debug(f"SKIPPED non-ATTLOG line: {redact_passwd(line.strip())[:120]}")
                             if _skipped_attlog_count % 50 == 1:
                                 logger.warning(
                                     f"Filtered {_skipped_attlog_count} non-ATTLOG lines (cumulative)"
@@ -375,10 +489,22 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
 
 async def main():
-    global _audit, _forwarder
+    global _audit, _forwarder, _command_queue
 
     # Generate self-signed cert for TLS
     generate_self_signed_cert()
+
+    # CommandQueue in-memory para el endpoint /control/enqueue (PR A.1, ADR-076).
+    _command_queue = CommandQueue()
+    if CONTROL_ENDPOINT_ENABLED and not CONTROL_ENDPOINT_TOKEN:
+        logger.error(
+            "control_endpoint_enabled=true pero control_endpoint_token vacio: "
+            "el endpoint /control/enqueue respondera 503 hasta configurar un token"
+        )
+    logger.info(
+        f"Control endpoint /control/enqueue: "
+        f"{'enabled' if CONTROL_ENDPOINT_ENABLED else 'disabled'}"
+    )
 
     # Audit local + fan-out OPT-IN al backend (v1.7.0). El audit se escribe
     # SIEMPRE (paridad Hikvision, ADR-004 Opcion C); el forwarder solo si hay

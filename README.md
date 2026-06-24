@@ -129,3 +129,57 @@ pv_backend_verify_token: "<igual al secret zkteco_webhook_shared_secret del back
 pv_backend_queue_maxsize: 1000
 pv_backend_timeout_seconds: 3
 ```
+
+## Endpoint local `/control/enqueue` (v1.8.0+)
+
+Desde v1.8.0 el add-on expone un endpoint local para **encolar comandos ADMS**
+dirigidos al device (`DATA UPDATE/DELETE USERINFO`, `CHECK`, etc.). El backend
+`pv-backend` lo usa para crear/borrar usuarios en el MB10-VL sin tocar el menú
+físico (ADR-076, §5.9.253).
+
+> **PR A.1**: por ahora el endpoint **solo encola**. El drenado del comando al
+> device en `getrequest` llega en PR A.2 y el tracking del ACK en PR A.3.
+
+**Opt-in y seguro por defecto**: deshabilitado salvo que se configure
+explícitamente. Auth via header `X-Control-Token` con secreto compartido.
+
+| Parámetro | Descripción |
+|---|---|
+| `control_endpoint_enabled` | Habilita el endpoint (default `false`). Si `false` → 404. |
+| `control_endpoint_token` | Secreto compartido del header `X-Control-Token`. Vacío + habilitado → 503. |
+
+**Request**:
+
+```bash
+curl -k -X POST https://<ip-del-pi>:8083/control/enqueue \
+  -H "Content-Type: application/json" \
+  -H "X-Control-Token: <control_endpoint_token>" \
+  -d '{"sn":"UDP3260500207","payload":"CHECK"}'
+```
+
+> El servidor ADMS corre sobre TLS (certificado self-signed), por eso `https://`
+> + `-k`. El `payload` es el comando ZK literal **sin** el prefijo `C:<id>:`
+> (ese prefijo lo agrega el add-on al servirlo en PR A.2).
+
+**Respuesta `201 Created`**:
+
+```json
+{
+  "cmd_id": 1,
+  "sn": "UDP3260500207",
+  "enqueued_at": "2026-06-24T10:00:00-05:00"
+}
+```
+
+**Códigos de error**: `404` (deshabilitado), `503` (habilitado sin token),
+`401` (token inválido), `405` (método ≠ POST), `400` (body inválido: `sn`/
+`payload` vacío o `payload` con caracteres prohibidos — solo se aceptan
+`[A-Za-z0-9 =,_-:.]`).
+
+### Seguridad: redacción de `Passwd=` en logs (v1.8.0+)
+
+El MB10-VL pushea un snapshot `USER PIN=... Passwd=<plain> ...` antes del OPLOG
+de alta/modificación de usuario (§5.9.260). El flow oficial **no** usa passwords
+(solo huella/rostro/tarjeta), pero si un operador asigna uno localmente, el
+add-on ahora redacta el valor a `Passwd=<REDACTED>` **antes** de loguearlo,
+evitando el leak del secreto en los logs.
