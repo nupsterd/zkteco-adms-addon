@@ -19,9 +19,16 @@ import asyncio
 import logging
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
+
+# TTLs de cleanup del queue (PR A.3). Hardcoded por diseno (simplicidad > config);
+# si produccion exige tuning, promover a config.yaml en PR futuro.
+COMMAND_TTL_ACKED_SECONDS = 3600           # 1h: comando completo, ya no es util
+COMMAND_TTL_DELIVERED_SECONDS = 86400      # 24h: entregado pero device nunca ACKeo
+COMMAND_TTL_ENQUEUED_SECONDS = 604800      # 7d: device offline o sin polear
+COMMAND_CLEANUP_INTERVAL_SECONDS = 300     # 5 min entre iteraciones del loop
 
 
 @dataclass
@@ -39,6 +46,7 @@ class Command:
     enqueued_at: datetime             # cuando entro al queue
     delivered_at: datetime | None = None  # cuando fue servido en getrequest (None = no entregado)
     acked_at: datetime | None = None      # cuando llego el ACK del device (None = no ACKeado)
+    ack_response: str | None = None       # body crudo del ACK del device (None = sin ACK)
 
     def to_dict(self) -> dict:
         """Serializacion JSON-friendly (timestamps a ISO 8601)."""
@@ -49,6 +57,7 @@ class Command:
             "enqueued_at": self.enqueued_at.isoformat(),
             "delivered_at": self.delivered_at.isoformat() if self.delivered_at else None,
             "acked_at": self.acked_at.isoformat() if self.acked_at else None,
+            "ack_response": self.ack_response,
         }
 
 
@@ -76,7 +85,7 @@ class CommandQueue:
                 cmd_id=self._next_cmd_id,
                 sn=sn,
                 payload=payload,
-                enqueued_at=datetime.now(),
+                enqueued_at=datetime.now(timezone.utc),
             )
             self._queues[sn].append(cmd)
             self._by_id[cmd.cmd_id] = cmd
@@ -94,21 +103,72 @@ class CommandQueue:
                     return cmd
             return None
 
+    async def pop_for_delivery(self, sn: str) -> Command | None:
+        """Peek FIFO + mark_delivered atomicos en una sola toma del lock.
+
+        Reemplaza el patron `get_next_pending` + `mark_delivered` separados, eliminando
+        la race teorica entre dos polls concurrentes del mismo SN. Es el metodo que
+        usa el handler `getrequest` (PR A.2).
+        """
+        async with self._lock:
+            for cmd in self._queues.get(sn, ()):
+                if cmd.delivered_at is None:
+                    cmd.delivered_at = datetime.now(timezone.utc)
+                    return cmd
+            return None
+
     async def mark_delivered(self, cmd_id: int) -> None:
         """Marca un comando como entregado (servido en getrequest). Idempotente."""
         async with self._lock:
             cmd = self._by_id.get(cmd_id)
             if cmd is not None and cmd.delivered_at is None:
-                cmd.delivered_at = datetime.now()
+                cmd.delivered_at = datetime.now(timezone.utc)
 
-    async def mark_acked(self, cmd_id: int) -> None:
-        """Marca un comando como ACKeado por el device. Idempotente."""
+    async def mark_acked(self, cmd_id: int, response: str | None = None) -> None:
+        """Marca un comando como ACKeado por el device, guardando la response cruda. Idempotente."""
         async with self._lock:
             cmd = self._by_id.get(cmd_id)
             if cmd is not None and cmd.acked_at is None:
-                cmd.acked_at = datetime.now()
+                cmd.acked_at = datetime.now(timezone.utc)
+                cmd.ack_response = response
 
     async def get_status(self, cmd_id: int) -> Command | None:
         """Retorna el Command (para el endpoint /control/status de PR A.3) o None."""
         async with self._lock:
             return self._by_id.get(cmd_id)
+
+    async def size(self) -> int:
+        """Total de comandos in-memory (observabilidad del cleanup)."""
+        async with self._lock:
+            return len(self._by_id)
+
+    async def cleanup_expired(self) -> int:
+        """Evict comandos vencidos segun los 3 TTLs. Retorna count evicted.
+
+        - Acked > 1h: evict (caso normal post-exito).
+        - Delivered (sin acked) > 24h: evict (device no respondio, asumimos perdida).
+        - Enqueued (sin delivered) > 7d: evict (device offline cronico).
+        """
+        now = datetime.now(timezone.utc)
+        to_evict: list[int] = []
+        async with self._lock:
+            for cmd_id, cmd in self._by_id.items():
+                if cmd.acked_at is not None:
+                    if (now - cmd.acked_at) > timedelta(seconds=COMMAND_TTL_ACKED_SECONDS):
+                        to_evict.append(cmd_id)
+                elif cmd.delivered_at is not None:
+                    if (now - cmd.delivered_at) > timedelta(seconds=COMMAND_TTL_DELIVERED_SECONDS):
+                        to_evict.append(cmd_id)
+                else:
+                    if (now - cmd.enqueued_at) > timedelta(seconds=COMMAND_TTL_ENQUEUED_SECONDS):
+                        to_evict.append(cmd_id)
+            for cmd_id in to_evict:
+                cmd = self._by_id.pop(cmd_id, None)
+                if cmd is not None:
+                    q = self._queues.get(cmd.sn)
+                    if q is not None:
+                        try:
+                            q.remove(cmd)
+                        except ValueError:
+                            pass
+            return len(to_evict)

@@ -16,7 +16,10 @@ from urllib.parse import parse_qs
 
 from audit import AuditLogger
 from audit_schema import build_access_record, build_device_state_record
-from command_queue import CommandQueue
+from command_queue import (
+    CommandQueue,
+    COMMAND_CLEANUP_INTERVAL_SECONDS,
+)
 from forwarder import BackendForwarder
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -60,6 +63,11 @@ _CONTROL_PAYLOAD_RE = re.compile(r"^[A-Za-z0-9 =,_\-:.]+$")
 # Passwd vacio (`Passwd=` seguido de tab) NO se toca porque no hay secreto que
 # filtrar (decision de diseno del prompt PR A.1).
 _PASSWD_RE = re.compile(r"Passwd=[^\t\s]+")
+
+# Regex para extraer cmd_id del ACK del device en POST /iclock/devicecmd (PR A.3).
+# El protocolo ZK ADMS estandar usa `ID=<cmd_id>` en el body (query-string style).
+# Si el firmware del MB10-VL difiere, ajustar aca tras validacion empirica.
+_DEVICECMD_ACK_RE = re.compile(r"ID=(\d+)")
 
 # Inicializados en main() antes de servir.
 _audit = None
@@ -152,6 +160,55 @@ async def _handle_control_enqueue(method: str, headers: dict, body: str) -> str:
         "201 Created",
         {"cmd_id": cmd.cmd_id, "sn": cmd.sn, "enqueued_at": cmd.enqueued_at.isoformat()},
     )
+
+
+async def _handle_control_status(method: str, headers: dict, query: dict) -> str:
+    """Maneja `GET /control/status?cmd_id=<id>`: retorna estado de un comando.
+
+    Misma auth que /control/enqueue (X-Control-Token). PR A.3.
+    """
+    def _json(status: str, payload: dict) -> str:
+        return build_response(status, json.dumps(payload), "application/json")
+
+    # 1. Solo GET.
+    if method != "GET":
+        return _json("405 Method Not Allowed", {"error": "method_not_allowed"})
+
+    # 2. Endpoint deshabilitado => 404 (no revela que existe).
+    if not CONTROL_ENDPOINT_ENABLED:
+        return _json("404 Not Found", {"error": "not_found"})
+
+    # 3. Habilitado pero sin token configurado => config insegura => 503.
+    if not CONTROL_ENDPOINT_TOKEN:
+        logger.error(
+            "control_endpoint_enabled=true pero control_endpoint_token vacio: "
+            "endpoint /control/status inseguro, respondiendo 503"
+        )
+        return _json("503 Service Unavailable", {"error": "endpoint_misconfigured"})
+
+    # 4. Auth: token compartido en header X-Control-Token (comparacion constante).
+    provided = _header_get(headers, "X-Control-Token")
+    if not provided or not secrets.compare_digest(provided, CONTROL_ENDPOINT_TOKEN):
+        return _json("401 Unauthorized", {"error": "unauthorized"})
+
+    # 5. Query param cmd_id obligatorio + parseable a int.
+    cmd_id_raw = query.get("cmd_id")
+    if not cmd_id_raw:
+        return _json("400 Bad Request", {"error": "missing_cmd_id"})
+    try:
+        cmd_id = int(cmd_id_raw)
+    except (ValueError, TypeError):
+        return _json("400 Bad Request", {"error": "invalid_cmd_id"})
+
+    if _command_queue is None:
+        logger.error("CommandQueue no inicializado, respondiendo 503")
+        return _json("503 Service Unavailable", {"error": "queue_unavailable"})
+
+    cmd = await _command_queue.get_status(cmd_id)
+    if cmd is None:
+        return _json("404 Not Found", {"error": "cmd_id_not_found"})
+
+    return _json("200 OK", cmd.to_dict())
 
 # Contador in-memory de lineas no-ATTLOG filtradas (§5.9.40). Solo observabilidad.
 _skipped_attlog_count = 0
@@ -366,6 +423,9 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         elif path == "/control/enqueue":
             response = await _handle_control_enqueue(method, headers, body)
 
+        elif path == "/control/status":
+            response = await _handle_control_status(method, headers, query)
+
         elif "/iclock/cdata" in (path or ""):
             sn = query.get("SN", "unknown")
             
@@ -462,11 +522,39 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         elif "/iclock/getrequest" in (path or ""):
             sn = query.get("SN", "unknown")
             logger.debug(f"Command poll from: {sn}")
-            response = build_response("200 OK", "OK")
-        
+            cmd = None
+            if _command_queue is not None and sn and sn != "unknown":
+                cmd = await _command_queue.pop_for_delivery(sn)
+            if cmd is not None:
+                body_response = f"C:{cmd.cmd_id}:{cmd.payload}"
+                logger.info(
+                    f"Command delivered cmd_id={cmd.cmd_id} sn={sn} payload={cmd.payload}"
+                )
+                response = build_response("200 OK", body_response)
+            else:
+                response = build_response("200 OK", "OK")
+
         elif "/iclock/devicecmd" in (path or ""):
             sn = query.get("SN", "unknown")
             logger.info(f"Command result from {sn}: {body[:200]}")
+            if _command_queue is not None and body:
+                match = _DEVICECMD_ACK_RE.search(body)
+                if match:
+                    try:
+                        cmd_id = int(match.group(1))
+                    except (ValueError, TypeError):
+                        logger.warning(f"devicecmd con cmd_id no parseable: {body[:200]}")
+                    else:
+                        existing = await _command_queue.get_status(cmd_id)
+                        if existing is None:
+                            logger.warning(
+                                f"devicecmd ACK para cmd_id={cmd_id} desconocido (no en queue)"
+                            )
+                        else:
+                            await _command_queue.mark_acked(cmd_id, response=body[:500])
+                            logger.info(f"Command ACKed cmd_id={cmd_id} sn={sn}")
+                else:
+                    logger.warning(f"devicecmd sin cmd_id reconocible: {body[:200]}")
             response = build_response("200 OK", "OK")
         
         else:
@@ -488,6 +576,26 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             pass
 
 
+async def _cleanup_loop(queue: CommandQueue):
+    """Background task: cleanup periodico del CommandQueue (PR A.3).
+
+    Fail-safe total: una iteracion rota no mata el loop. Sleep PRIMERO para no
+    correr inmediatamente al startup (los Commands recien creados no van a estar
+    vencidos de todas formas).
+    """
+    while True:
+        await asyncio.sleep(COMMAND_CLEANUP_INTERVAL_SECONDS)
+        try:
+            evicted = await queue.cleanup_expired()
+            if evicted > 0:
+                size = await queue.size()
+                logger.info(
+                    f"CommandQueue cleanup: evicted={evicted} remaining={size}"
+                )
+        except Exception:
+            logger.exception("cleanup_loop iteration failed (continuing)")
+
+
 async def main():
     global _audit, _forwarder, _command_queue
 
@@ -504,6 +612,12 @@ async def main():
     logger.info(
         f"Control endpoint /control/enqueue: "
         f"{'enabled' if CONTROL_ENDPOINT_ENABLED else 'disabled'}"
+    )
+
+    asyncio.create_task(_cleanup_loop(_command_queue))
+    logger.info(
+        f"CommandQueue cleanup loop iniciado "
+        f"(interval={COMMAND_CLEANUP_INTERVAL_SECONDS}s)"
     )
 
     # Audit local + fan-out OPT-IN al backend (v1.7.0). El audit se escribe
