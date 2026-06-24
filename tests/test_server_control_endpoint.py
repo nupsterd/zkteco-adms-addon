@@ -140,3 +140,200 @@ async def test_payload_accepts_real_adms_command():
     body = json.dumps({"sn": "SN1", "payload": "DATA UPDATE USERINFO PIN=42,Name=Pepito"})
     resp = await server._handle_control_enqueue("POST", _auth_headers(), body)
     assert _status_code(resp) == 201
+
+
+# ---------------------------------------------------------------------------
+# Harness raw-TCP para los handlers inline de handle_client (getrequest /
+# devicecmd): se driva handle_client con reader/writer falsos y se captura la
+# respuesta HTTP cruda escrita. Evita TLS y red real (mismo espiritu que arriba).
+# ---------------------------------------------------------------------------
+
+
+class _FakeReader:
+    def __init__(self, data: bytes):
+        self._data = data
+
+    async def read(self, _n: int) -> bytes:
+        data, self._data = self._data, b""
+        return data
+
+
+class _FakeWriter:
+    def __init__(self):
+        self.buf = b""
+
+    def get_extra_info(self, _key):
+        return ("127.0.0.1", 12345)
+
+    def write(self, data: bytes):
+        self.buf += data
+
+    async def drain(self):
+        pass
+
+    def close(self):
+        pass
+
+    async def wait_closed(self):
+        pass
+
+
+def _raw_request(method: str, path: str, body: str = "", headers: dict | None = None) -> bytes:
+    lines = [f"{method} {path} HTTP/1.1"]
+    for key, val in (headers or {}).items():
+        lines.append(f"{key}: {val}")
+    lines.append("")
+    lines.append(body)
+    return "\r\n".join(lines).encode("utf-8")
+
+
+async def _run_handle_client(raw: bytes) -> str:
+    writer = _FakeWriter()
+    await server.handle_client(_FakeReader(raw), writer)
+    return writer.buf.decode("utf-8")
+
+
+# --- PR A.2: drain en GET /iclock/getrequest ------------------------------
+
+
+async def test_getrequest_with_empty_queue_returns_ok():
+    resp = await _run_handle_client(_raw_request("GET", "/iclock/getrequest?SN=X"))
+    assert _status_code(resp) == 200
+    assert _body(resp) == "OK"
+
+
+async def test_getrequest_with_one_command_returns_C_format():
+    cmd = await server._command_queue.enqueue("X", "DATA UPDATE USERINFO PIN=42")
+    resp = await _run_handle_client(_raw_request("GET", "/iclock/getrequest?SN=X"))
+    assert _body(resp) == f"C:{cmd.cmd_id}:DATA UPDATE USERINFO PIN=42"
+    stored = await server._command_queue.get_status(cmd.cmd_id)
+    assert stored.delivered_at is not None
+
+
+async def test_getrequest_serves_two_commands_in_two_polls():
+    c1 = await server._command_queue.enqueue("X", "CMD_A")
+    c2 = await server._command_queue.enqueue("X", "CMD_B")
+    r1 = await _run_handle_client(_raw_request("GET", "/iclock/getrequest?SN=X"))
+    r2 = await _run_handle_client(_raw_request("GET", "/iclock/getrequest?SN=X"))
+    r3 = await _run_handle_client(_raw_request("GET", "/iclock/getrequest?SN=X"))
+    assert _body(r1) == f"C:{c1.cmd_id}:CMD_A"
+    assert _body(r2) == f"C:{c2.cmd_id}:CMD_B"
+    assert _body(r3) == "OK"
+
+
+async def test_getrequest_isolation_by_sn():
+    cmd = await server._command_queue.enqueue("A", "CMD_A")
+    resp_b = await _run_handle_client(_raw_request("GET", "/iclock/getrequest?SN=B"))
+    assert _body(resp_b) == "OK"
+    resp_a = await _run_handle_client(_raw_request("GET", "/iclock/getrequest?SN=A"))
+    assert _body(resp_a) == f"C:{cmd.cmd_id}:CMD_A"
+
+
+async def test_getrequest_without_sn_does_not_crash():
+    resp = await _run_handle_client(_raw_request("GET", "/iclock/getrequest"))
+    assert _status_code(resp) == 200
+    assert _body(resp) == "OK"
+
+
+# --- PR A.3: parse ACK en POST /iclock/devicecmd --------------------------
+
+
+async def test_devicecmd_with_valid_ID_marks_acked_and_stores_response():
+    cmd = await server._command_queue.enqueue("X", "CMD_A")
+    await server._command_queue.pop_for_delivery("X")
+    resp = await _run_handle_client(
+        _raw_request("POST", "/iclock/devicecmd?SN=X", body="ID=1&Return=0&CMD=DATA")
+    )
+    assert _status_code(resp) == 200
+    stored = await server._command_queue.get_status(cmd.cmd_id)
+    assert stored.acked_at is not None
+    assert "ID=1&Return=0&CMD=DATA" in stored.ack_response
+
+
+async def test_devicecmd_without_ID_logs_warning_no_crash():
+    cmd = await server._command_queue.enqueue("X", "CMD_A")
+    resp = await _run_handle_client(
+        _raw_request("POST", "/iclock/devicecmd?SN=X", body="Return=0&CMD=DATA")
+    )
+    assert _status_code(resp) == 200
+    stored = await server._command_queue.get_status(cmd.cmd_id)
+    assert stored.acked_at is None
+
+
+async def test_devicecmd_with_unknown_cmd_id_does_not_crash():
+    cmd = await server._command_queue.enqueue("X", "CMD_A")
+    resp = await _run_handle_client(
+        _raw_request("POST", "/iclock/devicecmd?SN=X", body="ID=999&Return=0")
+    )
+    assert _status_code(resp) == 200
+    stored = await server._command_queue.get_status(cmd.cmd_id)
+    assert stored.acked_at is None
+
+
+async def test_devicecmd_with_empty_body_does_not_crash():
+    resp = await _run_handle_client(_raw_request("POST", "/iclock/devicecmd?SN=X", body=""))
+    assert _status_code(resp) == 200
+
+
+# --- PR A.3: GET /control/status ------------------------------------------
+
+
+async def test_control_status_returns_200_with_full_dict():
+    cmd = await server._command_queue.enqueue("SN1", "CHECK")
+    resp = await server._handle_control_status("GET", _auth_headers(), {"cmd_id": str(cmd.cmd_id)})
+    assert _status_code(resp) == 200
+    payload = json.loads(_body(resp))
+    for key in ("cmd_id", "sn", "payload", "enqueued_at", "delivered_at", "acked_at", "ack_response"):
+        assert key in payload
+    assert payload["cmd_id"] == cmd.cmd_id
+
+
+async def test_control_status_returns_404_for_unknown_cmd_id():
+    resp = await server._handle_control_status("GET", _auth_headers(), {"cmd_id": "99999"})
+    assert _status_code(resp) == 404
+    assert json.loads(_body(resp))["error"] == "cmd_id_not_found"
+
+
+async def test_control_status_returns_400_missing_cmd_id():
+    resp = await server._handle_control_status("GET", _auth_headers(), {})
+    assert _status_code(resp) == 400
+    assert json.loads(_body(resp))["error"] == "missing_cmd_id"
+
+
+async def test_control_status_returns_400_invalid_cmd_id():
+    resp = await server._handle_control_status("GET", _auth_headers(), {"cmd_id": "abc"})
+    assert _status_code(resp) == 400
+    assert json.loads(_body(resp))["error"] == "invalid_cmd_id"
+
+
+async def test_control_status_returns_401_without_token():
+    resp = await server._handle_control_status(
+        "GET", {"Content-Type": "application/json"}, {"cmd_id": "1"}
+    )
+    assert _status_code(resp) == 401
+
+
+async def test_control_status_returns_401_with_wrong_token():
+    resp = await server._handle_control_status(
+        "GET", _auth_headers("token_incorrecto"), {"cmd_id": "1"}
+    )
+    assert _status_code(resp) == 401
+
+
+async def test_control_status_returns_404_when_disabled():
+    server.CONTROL_ENDPOINT_ENABLED = False
+    resp = await server._handle_control_status("GET", _auth_headers(), {"cmd_id": "1"})
+    assert _status_code(resp) == 404
+
+
+async def test_control_status_returns_503_when_enabled_but_token_empty():
+    server.CONTROL_ENDPOINT_TOKEN = ""
+    resp = await server._handle_control_status(
+        "GET", {"X-Control-Token": "loquesea"}, {"cmd_id": "1"}
+    )
+    assert _status_code(resp) == 503
+
+
+async def test_control_status_returns_405_on_post():
+    resp = await server._handle_control_status("POST", _auth_headers(), {"cmd_id": "1"})
+    assert _status_code(resp) == 405
