@@ -396,17 +396,113 @@ def _is_valid_attlog_line(line: str) -> bool:
 
 
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-    """Handle each incoming TCP/TLS connection."""
+    """Handle each incoming TCP/TLS connection.
+
+    Lectura HTTP/1.1 compliant:
+    1. Lee bytes hasta encontrar el separador headers/body (`\\r\\n\\r\\n`).
+    2. Parsea `Content-Length` del header.
+    3. Lee EXACTAMENTE Content-Length bytes del body despues de los headers.
+
+    Defensa anti-DOS: maximo 65536 bytes de headers + Content-Length acotado.
+
+    Fix bug §5.9.292: el read(8192) original retornaba el primer recv() del
+    buffer TCP. Funcionaba con clientes que envian headers+body en un solo
+    write (curl, MB10-VL firmware) pero fallaba con clientes que separan
+    headers y body en writes distintos (httpx con json=, requests session
+    persistente). Sintoma: 400 invalid_json aleatorio.
+    """
     global _skipped_attlog_count
     addr = writer.get_extra_info('peername')
-    
+
     try:
-        raw_data = await asyncio.wait_for(reader.read(8192), timeout=15.0)
-        
+        # --- BEGIN FIX §5.9.292: Content-Length aware HTTP read ---
+        HEADERS_MAX_BYTES = 65536          # cap anti-DOS de headers
+        BODY_MAX_BYTES = 10 * 1024 * 1024  # 10 MiB cap anti-DOS de body
+        SEPARATOR = b"\r\n\r\n"
+
+        # 1. Leer headers hasta encontrar el separador.
+        buf = b""
+        sep_idx = -1
+        deadline = asyncio.get_event_loop().time() + 15.0
+        while sep_idx < 0:
+            remaining_time = deadline - asyncio.get_event_loop().time()
+            if remaining_time <= 0:
+                logger.warning(f"Header read timeout from {addr}")
+                writer.close()
+                return
+            try:
+                chunk = await asyncio.wait_for(reader.read(4096), timeout=remaining_time)
+            except asyncio.TimeoutError:
+                logger.warning(f"Header read timeout from {addr}")
+                writer.close()
+                return
+            if not chunk:
+                # Conexion cerrada por el cliente.
+                writer.close()
+                return
+            buf += chunk
+            if len(buf) > HEADERS_MAX_BYTES:
+                logger.warning(f"Headers too large from {addr} (>{HEADERS_MAX_BYTES} bytes)")
+                writer.close()
+                return
+            sep_idx = buf.find(SEPARATOR)
+
+        header_part = buf[:sep_idx]
+        body_early = buf[sep_idx + len(SEPARATOR):]
+
+        # 2. Parsear Content-Length del header (case-insensitive).
+        content_length = 0
+        try:
+            header_lines = header_part.decode("utf-8", errors="replace").split("\r\n")
+            for line in header_lines[1:]:  # skip request line
+                if ":" not in line:
+                    continue
+                key, val = line.split(":", 1)
+                if key.strip().lower() == "content-length":
+                    try:
+                        content_length = int(val.strip())
+                    except ValueError:
+                        content_length = 0
+                    break
+        except Exception as e:
+            logger.warning(f"Failed parsing headers from {addr}: {e}")
+            writer.close()
+            return
+
+        if content_length < 0 or content_length > BODY_MAX_BYTES:
+            logger.warning(f"Content-Length out of bounds from {addr}: {content_length}")
+            writer.close()
+            return
+
+        # 3. Leer el resto del body (lo que falta tras body_early).
+        body_bytes = body_early
+        remaining = content_length - len(body_early)
+        while remaining > 0:
+            remaining_time = deadline - asyncio.get_event_loop().time()
+            if remaining_time <= 0:
+                logger.warning(
+                    f"Body read timeout from {addr} (read {len(body_bytes)}/{content_length})"
+                )
+                writer.close()
+                return
+            try:
+                chunk = await asyncio.wait_for(reader.read(min(remaining, 65536)), timeout=remaining_time)
+            except asyncio.TimeoutError:
+                logger.warning(f"Body read timeout from {addr}")
+                writer.close()
+                return
+            if not chunk:
+                break
+            body_bytes += chunk
+            remaining -= len(chunk)
+
+        raw_data = header_part + SEPARATOR + body_bytes
+        # --- END FIX §5.9.292 ---
+
         if not raw_data:
             writer.close()
             return
-        
+
         method, path, headers, query, body = parse_http_request(raw_data)
         logger.info(f"REQUEST {addr[0]}: {method} {path} query={query} body_len={len(body)}")
         
