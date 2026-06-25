@@ -71,3 +71,102 @@ def build_device_state_record(sn: str, state: str = "online") -> dict:
             "state": state,
         },
     }
+
+
+def _envelope(sn: str, event: dict) -> dict:
+    """Arma el sobre raiz comun del schema unificado alrededor de un ``event``."""
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "received_ts": _received_ts(),
+        "device_brand": DEVICE_BRAND,
+        "device_model": DEVICE_MODEL,
+        "device_sn": sn,
+        "device_mac": None,
+        "event": event,
+    }
+
+
+def build_oplog_record(sn: str, parsed: dict, raw_line: str) -> dict:
+    """Record de una operacion OPLOG (USER MODIFY/DELETE, post-FP commit) (PR A.4).
+
+    ``parsed`` proviene de ``operlog_parser.parse_oplog_line``. El OPLOG trae su
+    propio ``device_ts`` (estable entre reentregas del MB10-VL) => el flag
+    ``inferred_timestamp`` queda False: B.3 debe usar ``device_ts`` como timestamp
+    de idempotencia (constraint ``ux_eventos_idempotencia``, NULLS NOT DISTINCT)
+    junto a ``codigo_mayor=oplog_code`` para no colisionar dos OPLOG del mismo
+    segundo (p.ej. OPLOG 6 y OPLOG 30 comparten device_ts).
+    """
+    return _envelope(
+        sn,
+        {
+            "tipo": parsed["tipo"],
+            "oplog_code": parsed["oplog_code"],
+            "param": parsed["param"],
+            "device_ts": parsed["device_ts"],
+            "pin": parsed["pin"],
+            "raw_extra": parsed["raw_extra"],
+            "raw_line": raw_line,
+            "inferred_timestamp": False,
+        },
+    )
+
+
+def build_user_snapshot_record(sn: str, parsed: dict, raw_line: str) -> dict:
+    """Record de un snapshot USER (PR A.4).
+
+    El USER snapshot NO trae ``device_ts`` propio => ``inferred_timestamp`` True:
+    B.3 usa ``received_ts`` (wall clock con microsegundos) como timestamp y acepta
+    el riesgo de duplicado en una reentrega rara (decision cerrada Chat 4a; la
+    correlacion con el OPLOG vecino es scope B.3, no A.4). El ``passwd`` ya viene
+    redactado por el caller (§5.9.260).
+    """
+    return _envelope(
+        sn,
+        {
+            "tipo": "user_snapshot",
+            "pin": parsed["pin"],
+            "fields": parsed["fields"],
+            "device_ts": None,
+            "raw_line": raw_line,
+            "inferred_timestamp": True,
+        },
+    )
+
+
+def build_fp_template_record(sn: str, parsed: dict, raw_line: str) -> dict:
+    """Record de un template biometrico FP (PR A.4).
+
+    Sin ``device_ts`` propio => ``inferred_timestamp`` True (ver
+    build_user_snapshot_record). ``tmp_b64`` se preserva completo.
+    """
+    return _envelope(
+        sn,
+        {
+            "tipo": "fingerprint_template",
+            "pin": parsed["pin"],
+            "fid": parsed["fid"],
+            "size": parsed["size"],
+            "valid": parsed["valid"],
+            "tmp_b64": parsed["tmp_b64"],
+            "device_ts": None,
+            "raw_line": raw_line,
+            "inferred_timestamp": True,
+        },
+    )
+
+
+def build_operlog_record(sn: str, parsed: dict, raw_line: str) -> dict:
+    """Dispatcher: arma el record unificado segun ``parsed["tipo"]`` (PR A.4).
+
+    Acepta la salida de ``operlog_parser.classify_operlog_line``. Levanta
+    ``ValueError`` ante un tipo desconocido (defensivo; el caller solo pasa tipos
+    ya clasificados).
+    """
+    tipo = parsed["tipo"]
+    if tipo.startswith("oplog_"):
+        return build_oplog_record(sn, parsed, raw_line)
+    if tipo == "user_snapshot":
+        return build_user_snapshot_record(sn, parsed, raw_line)
+    if tipo == "fingerprint_template":
+        return build_fp_template_record(sn, parsed, raw_line)
+    raise ValueError(f"tipo OPERLOG desconocido: {tipo!r}")

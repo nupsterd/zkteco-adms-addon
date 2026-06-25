@@ -15,12 +15,17 @@ from datetime import datetime
 from urllib.parse import parse_qs
 
 from audit import AuditLogger
-from audit_schema import build_access_record, build_device_state_record
+from audit_schema import (
+    build_access_record,
+    build_device_state_record,
+    build_operlog_record,
+)
 from command_queue import (
     CommandQueue,
     COMMAND_CLEANUP_INTERVAL_SECONDS,
 )
 from forwarder import BackendForwarder
+from operlog_parser import classify_operlog_line
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 logger = logging.getLogger(__name__)
@@ -46,6 +51,12 @@ PV_BACKEND_TIMEOUT = float(_options.get("pv_backend_timeout_seconds", 3))
 # `or` (no solo el default de .get): el campo es opcional (str?), asi que puede
 # venir ausente, null o "" desde la UI -> caemos siempre al default (§5.9.36).
 AUDIT_LOG_PATH = _options.get("audit_log_path") or "/config/audit.log"
+
+# Fan-out OPT-IN de eventos OPERLOG/USER/FP al backend (PR A.4). Default False:
+# el webhook backend /eventos/zkteco hoy solo acepta event.tipo access|
+# device_state (whitelist estricta _TIPO_POR_EVENT_TIPO); los tipos OPERLOG los
+# habilita B.3. Con el flag off el forward es no-op => merge seguro pre-B.3.
+FORWARD_OPERLOG_ENABLED = bool(_options.get("forward_operlog_enabled", False))
 
 # Endpoint local de control (PR A.1, ADR-076). Deshabilitado por defecto: el
 # endpoint solo encola comandos ADMS hacia el device (drain en PR A.2). Sin
@@ -395,6 +406,45 @@ def _is_valid_attlog_line(line: str) -> bool:
     return parts[3].isdigit()
 
 
+async def _maybe_forward_operlog(sn: str, line: str) -> None:
+    """Clasifica y forwardea una linea OPERLOG/USER/FP al backend (PR A.4).
+
+    Se llama por cada linea que el filtro ATTLOG descarta (§5.9.294): OPLOG 6/9/30,
+    USER snapshot y FP template. Gated por ``FORWARD_OPERLOG_ENABLED`` (default
+    False, A.4-prep): el webhook backend solo acepta event.tipo access|device_state
+    hoy; B.3 habilita los tipos OPERLOG. Con el flag off es no-op total.
+
+    Reusa el ``BackendForwarder`` existente (auth ``X-PV-ZKTeco-Token`` opuesta al
+    ``X-Control-Token`` de §5.9.276, URL configurable, retry/backoff/fail-silent),
+    paridad con el path ATTLOG (decision D5). ``enqueue`` ya es no-bloqueante
+    (``put_nowait``), por eso NO se envuelve en ``asyncio.create_task``.
+
+    Seguridad: la linea se redacta (``redact_passwd``, §5.9.260) ANTES de parsear y
+    forwardear, para que ningun Passwd en texto plano salga del add-on (el body
+    crudo del USER snapshot SI trae el Passwd; solo el log se redactaba hasta hoy).
+
+    Fail-safe total: el handler raw asyncio NUNCA debe propagar excepciones al
+    MB10-VL. ``enqueue`` ya es fail-silent (drop+WARNING si la cola se llena); el
+    try/except cubre cualquier raise inesperado y deja seguir la respuesta OK 200.
+    """
+    if not FORWARD_OPERLOG_ENABLED:
+        return
+    safe_line = redact_passwd(line)
+    classified = classify_operlog_line(safe_line)
+    if classified is None:
+        return
+    tipo, parsed = classified
+    if _forwarder is None:
+        logger.debug(f"operlog_forward_skipped_forwarder_none tipo={tipo}")
+        return
+    try:
+        record = build_operlog_record(sn, parsed, safe_line.strip())
+        await _forwarder.enqueue(record)
+        logger.info(f"OPERLOG forwarded tipo={tipo} sn={sn} pin={parsed.get('pin')}")
+    except Exception:
+        logger.error("operlog_enqueue_unexpected_error", exc_info=True)
+
+
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     """Handle each incoming TCP/TLS connection.
 
@@ -542,6 +592,9 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                                 logger.warning(
                                     f"Filtered {_skipped_attlog_count} non-ATTLOG lines (cumulative)"
                                 )
+                            # PR A.4: las lineas no-ATTLOG (OPLOG/USER/FP) son justo
+                            # las que forwardeamos al backend (gated por feature flag).
+                            await _maybe_forward_operlog(sn, line)
                         continue
                     parts = line.strip().split("\t")
                     if len(parts) >= 4:
