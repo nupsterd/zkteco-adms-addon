@@ -25,6 +25,7 @@ options:
   pv_backend_verify_token: ""
   pv_backend_queue_maxsize: 1000
   pv_backend_timeout_seconds: 3
+  forward_operlog_enabled: false
   control_endpoint_enabled: false
   control_endpoint_token: ""
 schema:
@@ -35,6 +36,7 @@ schema:
   pv_backend_verify_token: "password?"
   pv_backend_queue_maxsize: "int(10,100000)"
   pv_backend_timeout_seconds: "int(1,30)"
+  forward_operlog_enabled: bool
   control_endpoint_enabled: bool
   control_endpoint_token: "password?"
 map:
