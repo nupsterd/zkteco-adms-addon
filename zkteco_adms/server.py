@@ -68,7 +68,7 @@ CONTROL_ENDPOINT_TOKEN = _options.get("control_endpoint_token") or ""
 # Regex de validacion del payload del comando ZK: alfanumerico + separadores
 # comunes (`= , _ - : .` y espacio). Sin newlines ni caracteres de control para
 # que el payload no rompa la respuesta HTTP cruda ni el protocolo ADMS.
-_CONTROL_PAYLOAD_RE = re.compile(r"^[A-Za-z0-9 =,_\-:.]+$")
+_CONTROL_PAYLOAD_RE = re.compile(r"^[A-Za-z0-9 =,_\-:.\t]+$")
 
 # Redaccion del campo Passwd= en texto logueado (§5.9.260). `+` (no `*`): un
 # Passwd vacio (`Passwd=` seguido de tab) NO se toca porque no hay secreto que
