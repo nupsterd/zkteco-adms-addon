@@ -142,6 +142,17 @@ async def test_payload_accepts_real_adms_command():
     assert _status_code(resp) == 201
 
 
+async def test_payload_accepts_real_adms_command_with_tab_separator():
+    # §5.9.311 Chat 4b S8: protocolo ADMS canonical usa TAB como separador
+    # estructural entre campos. Whitelist debe aceptarlo (no es inyeccion).
+    # Bloquearlo rompe DATA UPDATE USERINFO multifield, unico flow real de
+    # alta de usuario via API (B.3 push-pendientes + B.4 desactivar).
+    body = json.dumps({"sn": "SN1", "payload": "DATA UPDATE USERINFO PIN=7\tName=Test\tGrp=1"})
+    resp = await server._handle_control_enqueue("POST", _auth_headers(), body)
+    assert _status_code(resp) == 201
+    assert json.loads(_body(resp))["sn"] == "SN1"
+
+
 # ---------------------------------------------------------------------------
 # Harness raw-TCP para los handlers inline de handle_client (getrequest /
 # devicecmd): se driva handle_client con reader/writer falsos y se captura la
